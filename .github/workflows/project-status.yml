@@ -88,21 +88,31 @@ jobs:
                 `query($owner: String!, $repo: String!, $number: Int!) {
                   repository(owner: $owner, name: $repo) {
                     pullRequest(number: $number) {
-                      id
-                      associatedIssues(first: 50) {
+                      closingIssuesReferences(first: 50) {
                         nodes {
+                          id
                           number
                           projectItems(first: 50) {
-                            nodes { id project { id } }
+                            nodes {
+                              id
+                              project {
+                                id
+                              }
+                            }
                           }
                         }
                       }
                     }
                   }
                 }`,
-                { owner: context.repo.owner, repo: context.repo.repo, number: prNumber }
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  number: prNumber,
+                }
               );
-              return result.repository?.pullRequest?.associatedIssues?.nodes ?? [];
+
+              return result.repository?.pullRequest?.closingIssuesReferences?.nodes ?? [];
             }
 
             async function setStatus(project, statusField, issue, targetStatus) {
