@@ -1,0 +1,180 @@
+name: GitHub Project Status Automation
+
+on:
+  issues:
+    types: [assigned]
+  pull_request:
+    types: [opened, reopened, ready_for_review, closed]
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  update-project-status:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update GitHub Project status
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PROJECT_TOKEN }}
+          script: |
+            const owner = 'HoangLowCodee';
+            const projectNumber = 8;
+            const targetStatusByEvent = {
+              issueAssigned: 'In Progress',
+              pullRequestOpened: 'In Review',
+              pullRequestMerged: 'Done',
+            };
+
+            async function getProject() {
+              const result = await github.graphql(
+                `query($login: String!, $number: Int!) {
+                  user(login: $login) {
+                    projectV2(number: $number) {
+                      id
+                      title
+                      fields(first: 50) {
+                        nodes {
+                          ... on ProjectV2SingleSelectField {
+                            id
+                            name
+                            options { id name }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }`,
+                { login: owner, number: projectNumber }
+              );
+
+              const project = result.user?.projectV2;
+              if (!project) {
+                throw new Error(`Could not find user Project #${projectNumber} for ${owner}.`);
+              }
+
+              const statusField = project.fields.nodes.find(
+                field => field?.name === 'Status' && field.options
+              );
+              if (!statusField) {
+                throw new Error('Could not find a single-select field named "Status" in the Project.');
+              }
+
+              return { project, statusField };
+            }
+
+            async function getIssueNode(issueNumber) {
+              const result = await github.graphql(
+                `query($owner: String!, $repo: String!, $number: Int!) {
+                  repository(owner: $owner, name: $repo) {
+                    issue(number: $number) {
+                      id
+                      number
+                      projectItems(first: 50) {
+                        nodes { id project { id } }
+                      }
+                    }
+                  }
+                }`,
+                { owner: context.repo.owner, repo: context.repo.repo, number: issueNumber }
+              );
+              return result.repository?.issue;
+            }
+
+            async function getLinkedIssues(prNumber) {
+              const result = await github.graphql(
+                `query($owner: String!, $repo: String!, $number: Int!) {
+                  repository(owner: $owner, name: $repo) {
+                    pullRequest(number: $number) {
+                      id
+                      associatedIssues(first: 50) {
+                        nodes {
+                          number
+                          projectItems(first: 50) {
+                            nodes { id project { id } }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }`,
+                { owner: context.repo.owner, repo: context.repo.repo, number: prNumber }
+              );
+              return result.repository?.pullRequest?.associatedIssues?.nodes ?? [];
+            }
+
+            async function setStatus(project, statusField, issue, targetStatus) {
+              const option = statusField.options.find(item => item.name === targetStatus);
+              if (!option) {
+                throw new Error(
+                  `Status option "${targetStatus}" does not exist. Add it to the Project Status field first.`
+                );
+              }
+
+              const projectItem = issue.projectItems.nodes.find(
+                item => item.project.id === project.id
+              );
+              if (!projectItem) {
+                core.info(`Issue #${issue.number} is not in Project #${projectNumber}; skipping.`);
+                return;
+              }
+
+              await github.graphql(
+                `mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+                  updateProjectV2ItemFieldValue(input: {
+                    projectId: $projectId
+                    itemId: $itemId
+                    fieldId: $fieldId
+                    value: { singleSelectOptionId: $optionId }
+                  }) {
+                    projectV2Item { id }
+                  }
+                }`,
+                {
+                  projectId: project.id,
+                  itemId: projectItem.id,
+                  fieldId: statusField.id,
+                  optionId: option.id,
+                }
+              );
+
+              core.info(`Issue #${issue.number}: Status → ${targetStatus}`);
+            }
+
+            const { project, statusField } = await getProject();
+            const eventName = context.eventName;
+            const payload = context.payload;
+
+            if (eventName === 'issues' && payload.action === 'assigned') {
+              const issue = await getIssueNode(payload.issue.number);
+              if (issue) {
+                await setStatus(project, statusField, issue, targetStatusByEvent.issueAssigned);
+              }
+              return;
+            }
+
+            if (eventName === 'pull_request') {
+              const pr = payload.pull_request;
+
+              if (payload.action === 'closed' && !pr.merged) {
+                core.info('PR was closed without merging; no status change.');
+                return;
+              }
+
+              const targetStatus =
+                payload.action === 'closed'
+                  ? targetStatusByEvent.pullRequestMerged
+                  : targetStatusByEvent.pullRequestOpened;
+
+              const linkedIssues = await getLinkedIssues(pr.number);
+              if (linkedIssues.length === 0) {
+                core.info('No linked Issues found. Add "Closes #123" to the PR description.');
+                return;
+              }
+
+              for (const issue of linkedIssues) {
+                await setStatus(project, statusField, issue, targetStatus);
+              }
+            }
